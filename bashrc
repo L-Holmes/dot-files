@@ -82,12 +82,6 @@ if ! shopt -oq posix; then
     . /etc/bash_completion
   fi
 fi
-export PATH="$PATH:/opt/nvim-linux-x86_64/bin"
-
-# Make programs available system-wide
-export PATH="$PATH:/opt/nvim-linux-x86_64/bin"
-export PATH="$HOME/.cargo/bin:$PATH"
-export PATH=$PATH:/home/main/dart-sass
 
 # rust stuff
 . "$HOME/.cargo/env"
@@ -95,12 +89,17 @@ export PATH=$PATH:/home/main/dart-sass
 # --- Android SDK (added for Android testing) ---
 export ANDROID_HOME="$HOME/Android/Sdk"
 export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
-export PATH="$PATH:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin"
 # --- end Android SDK ---
 
-
-# add local bin to path
+# Make programs available system-wide
+export PATH="$PATH:/opt/nvim-linux-x86_64/bin"
+export PATH="$PATH:/opt/nvim-linux-x86_64/bin"
+export PATH="$HOME/.cargo/bin:$PATH"
+export PATH=$PATH:/home/main/dart-sass
+export PATH="$PATH:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin"
 export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/go/bin:$HOME/go/bin:$PATH"
+
 
 # make neovim the default editor
 export EDITOR=nvim
