@@ -1,4 +1,3 @@
-
 -- STANDARD SETTINGS --
 -- Disable default line numbers
 -- vim.wo.number = true
@@ -113,6 +112,7 @@ vim.api.nvim_set_keymap('i', 'KJ', '<Esc>', { noremap = true })
 vim.api.nvim_set_keymap('x', 'fj', '<Esc>', { noremap = true })
 vim.api.nvim_set_keymap('x', 'FJ', '<Esc>', { noremap = true })
 
+vim.api.nvim_set_keymap('n', 'V', '<Nop>', { noremap = true, silent = true })
 
 -- == FULL KEYMAP ==
 -- Generic Leader keys:   [ ' ', 'a', 'o', 'r' ]
@@ -162,12 +162,31 @@ vim.api.nvim_set_keymap('x', 'FJ', '<Esc>', { noremap = true })
 -- ; = !!!!!!!!!!                                           |
 
 -- === SELECTING OBJECTS ===
-vim.api.nvim_set_keymap('n', 'a', 'v`a', {noremap = true, silent = true, nowait = true})    -- select from the mark to the current point | copy
+-- select from the mark to the current point
+-- Straight after an f / d line jump it selects the whole lines instead: f / d put mark a at the start (or end) of the
+-- line you left and mark b at the end (or start) of the line you landed on, and a selects from mark a to mark b.
+-- In oil it uses V instead, so i / e then copy / cut those entries as whole lines (pasting copies / moves the files).
+-- After gg / ge it always uses V (oil or not), selecting every line from the one you left to the start / end of the file.
+local line_jump = nil -- { buf, cursor, mark_a, linewise } as the last f / d / gg / ge left them
+vim.keymap.set('n', 'a', function()
+  local j = line_jump
+  local oil = vim.bo.filetype == 'oil'
+  local cur = vim.api.nvim_win_get_cursor(0)
+  -- Still where the jump left you? In oil only the line counts: oil moves the cursor onto the file name after the jump.
+  local not_moved = j and (oil and j.cursor[1] == cur[1] or vim.deep_equal(j.cursor, cur))
+  if not_moved and j.buf == vim.api.nvim_get_current_buf()
+     and vim.deep_equal(j.mark_a, vim.api.nvim_buf_get_mark(0, 'a')) then
+    vim.cmd((j.linewise or oil) and 'normal! `aV`b' or 'normal! `av`b')
+  else
+    vim.cmd('normal! v`a')
+  end
+end, { silent = true, nowait = true })
 
 -- selecting [things other than the current char / line]
 vim.api.nvim_set_keymap('n', 'w', 'viw', {noremap = true, silent = true})    -- select word
 vim.api.nvim_set_keymap('n', 'v', '`[v`]', {noremap = true, silent = true})     -- select previously selected thing  TODO make it work for the last pasted thing as well???
-vim.api.nvim_set_keymap('n', 'O', 'vip', {noremap = true, silent = true})    -- select paragraph
+vim.api.nvim_set_keymap('n', 'xp', 'vip', {noremap = true, silent = true})   -- select paragraph
+vim.api.nvim_set_keymap('n', '<leader>a', '<C-v>`a', {noremap = true, silent = true}) -- block-select from the mark to the current point
  
 -- selecting in-between
 -- Each selects the pair you're in (or on); if you're not in one, it jumps to the next one (on any later line).
@@ -262,6 +281,10 @@ vim.keymap.set('n', '[', select_brackets('[', ']', false), sel)  -- inside []
 vim.keymap.set('n', ']', select_brackets('[', ']', true), sel)   -- around [] (including the brackets)
 vim.keymap.set('n', '{', select_brackets('{', '}', false), sel)  -- inside {}
 vim.keymap.set('n', '<', select_brackets('<', '>', false), sel)  -- inside <>
+vim.keymap.set('n', '>', select_brackets('<', '>', true), sel)   -- around <> (including the brackets)
+-- so < and > no longer indent in normal mode (<< / >>): that's <leader>, / <leader>. instead (a count works: 3<leader>.)
+vim.api.nvim_set_keymap('n', '<leader>,', '<<', { noremap = true, silent = true }) -- unindent line
+vim.api.nvim_set_keymap('n', '<leader>.', '>>', { noremap = true, silent = true }) -- indent line
 
 -- [ and ] act straight away, so remove every other mapping that starts with [ or ] - otherwise Vim waits
 -- to see if you're typing one of those. That's Neovim's defaults ([b ]b buffers, [d ]d diagnostics,
@@ -290,7 +313,29 @@ vim.api.nvim_set_keymap('n', 'ri', 'y$', {noremap = true, silent = true, nowait 
 vim.api.nvim_set_keymap('n', 'ry', 'y^', {noremap = true, silent = true, nowait = true})     -- select from current char to start of line | copy
  
 -- pasting  (paste and baste?)
-vim.api.nvim_set_keymap('n', 'p', '"_ddO<Esc>p==', {noremap = true, silent = true, nowait = true})     -- select current line | paste over top
+-- Byte column (0-based) where the last character of line lnum starts; 0 on an empty line
+local function last_char_col(lnum)
+  local text = vim.fn.getline(lnum)
+  if text == '' then return 0 end
+  return #text - 1 + vim.str_utf_start(text, #text)
+end
+
+-- Replace lines first..last with the register's lines (always whole lines), reindent them, and leave the register alone.
+local function paste_over_lines(first, last)
+  local reg = vim.v.register
+  if vim.fn.getreg(reg) == '' then return end
+  local lines = vim.fn.getreg(reg, 1, true)
+  vim.api.nvim_buf_set_lines(0, first - 1, last, true, lines)
+  local new_last = first + #lines - 1
+  vim.cmd('keepjumps normal! ' .. first .. 'G=' .. new_last .. 'G') -- reindent what was pasted
+  vim.api.nvim_buf_set_mark(0, '[', first, 0, {})                    -- so v selects the pasted lines
+  vim.api.nvim_buf_set_mark(0, ']', new_last, last_char_col(new_last), {})
+end
+
+-- select current line | paste over top
+-- Copied N lines? The first replaces the current line and the other N-1 are inserted below it, pushing the rest down.
+-- Works the same on the last line of the file.
+vim.keymap.set('n', 'p', function() local l = vim.fn.line('.'); paste_over_lines(l, l) end, { silent = true, nowait = true })
 vim.api.nvim_set_keymap('n', 'b', 'vp==', {noremap = true, silent = true, nowait = true})                -- select current char | paste over top
 vim.api.nvim_set_keymap('n', 'op', 'a <Esc>vp==', {noremap = true, silent = true, nowait = true})        -- create new char to right of current char | paste over that
 vim.api.nvim_set_keymap('n', 'ob', 'i <Esc>vp==', {noremap = true, silent = true, nowait = true})        -- create new char to left of current char | paste over that
@@ -312,6 +357,7 @@ vim.api.nvim_set_keymap('n', '<leader>u', 'O<Esc>', {noremap = true, silent = tr
 -- pasting new text (inserting)  (new and mew)
 vim.api.nvim_set_keymap('n', 'n', 'cc', {noremap = true, silent = true, nowait = true})                -- select current line | paste new text over top
 vim.api.nvim_set_keymap('n', 'm', 'r', {noremap = true, silent = true, nowait = true})                 -- select current char | paste new text over (replace char)
+vim.api.nvim_set_keymap('n', 'M', 'R', {noremap = true, silent = true})                                -- replace mode (type over the text)
 vim.api.nvim_set_keymap('n', 'on', 'a', {noremap = true, silent = true, nowait = true})                -- create new char to right of current char | paste new text over that
 vim.api.nvim_set_keymap('n', 'om', 'i', {noremap = true, silent = true, nowait = true})                -- create new char to left of current char | paste new text over that
 vim.api.nvim_set_keymap('n', 'rn', 'Da', {noremap = true, silent = true, nowait = true})               -- select from current char to end of line | paste new text over that
@@ -413,7 +459,7 @@ vim.api.nvim_set_keymap('n', '?', 'ma?\\V', {noremap = true})
 -- 'go' commands
 vim.api.nvim_set_keymap('n', 'gk', 'maH', {noremap = true, silent = true}) -- Go top of visible screen
 vim.api.nvim_set_keymap('n', 'gj', 'maL', {noremap = true, silent = true}) -- Go bottom of visible screen
-vim.api.nvim_set_keymap('n', 'ge', 'maG', {noremap = true, silent = true}) -- Go to end of file
+-- gg / ge (start / end of file) are set up after jump_to_line, so a can then select the lines you jumped over
 vim.api.nvim_set_keymap('n', 'gl', 'ma$', {noremap = true, silent = true}) -- Go to right end of line
 vim.api.nvim_set_keymap('n', 'gh', 'ma^', {noremap = true, silent = true}) -- Go to left end of line
 vim.api.nvim_set_keymap('n', 'g0', 'ma0', {noremap = true, silent = true}) -- Go to left end of line
@@ -427,7 +473,20 @@ vim.api.nvim_set_keymap('n', 'gp', '<C-o>', {noremap = true}) -- Go to previous 
 vim.api.nvim_set_keymap('v', 'i', 'y', {noremap = true, silent = true, nowait = true})     -- select current line | copy
  
 -- pasting  (paste and baste?)
-vim.api.nvim_set_keymap('v', 'p', 'p', {noremap = true, silent = true, nowait = true})     -- select current line | paste over top
+-- paste over top, keeping the register (so you can keep pasting the same thing)
+-- Selection covers more than one line (or is V)? Like p: the copied text replaces those whole lines.
+-- Selection within one line (e.g. w): replaces just the selected text.
+vim.keymap.set('x', 'p', function()
+  local mode = vim.fn.mode()
+  local first, last = vim.fn.line('v'), vim.fn.line('.')
+  if mode == 'V' or (mode == 'v' and first ~= last) then
+    if first > last then first, last = last, first end
+    vim.cmd('normal! \27') -- leave visual mode
+    paste_over_lines(first, last)
+  else
+    vim.cmd('normal! P') -- visual P = put without overwriting the register
+  end
+end, { silent = true, nowait = true })
  
 -- pasting empty (deleting)  (empty and umpty?)
 vim.api.nvim_set_keymap('v', 'e', 'd', {noremap = true, silent = true, nowait = true})           -- select current line | paste nothing over top (delete the line)
@@ -518,27 +577,6 @@ vim.keymap.set('n', 'xl', function()
   vim.api.nvim_command('normal! ' .. loop_line .. 'GV' .. last_body_line .. 'G')
 end, { noremap = true, silent = true })
  
--- ======== PARAMETER SELECTION (xp) ========
-vim.keymap.set('n', 'xp', function()
-  -- Find function definition
-  vim.fn.search('^\\s*def \\w\\+(\\?', 'bcW')
-  local line = vim.fn.getline('.')
- 
-  -- Find parentheses
-  local param_start = line:find('%(')
-  local param_end = line:find('%)')
- 
-  if param_start and param_end then
-    -- Select parameters (single line)
-    vim.fn.cursor(vim.fn.line('.'), param_start + 1)
-    vim.cmd('normal! v'..(param_end - 1)..'|')
-  elseif param_start then
-    -- Handle multi-line parameters
-    vim.fn.cursor(vim.fn.line('.'), param_start)
-    vim.cmd('normal! va(')
-  end
-end, { noremap = true, silent = true })
- 
 -- ======== CONDITIONAL SELECTION (xi) ========
 vim.keymap.set('n', 'xi', function()
   -- Find the start of the if block
@@ -607,7 +645,6 @@ vim.keymap.set('n', 'xI', function()
   vim.api.nvim_command('normal! ' .. cond_line .. 'GV' .. last_body_line .. 'G')
 end, { noremap = true, silent = true })
  
-vim.api.nvim_set_keymap('x', 'p', "'pgvy'", { noremap = true, silent = true, expr = true }) -- Keep pasting the same thing in visual mode (without the replaced text overwriting the thing being pasted)
  
 -- make j and k scroll
 vim.keymap.set('n', 'j', function()
@@ -953,6 +990,10 @@ require("oil").setup({
     -- Add your custom remappings here
     ['l'] = 'actions.select', -- Go into folder / open file
     ['h'] = 'actions.parent',   -- Go back up a level
+    -- e / i take the whole line (like Vd / Vy), not just the name. The line holds oil's hidden entry id, so pasting it
+    -- into an oil buffer moves (e) or copies (i) the actual file / folder, not just its name.
+    ['e'] = { 'dd', mode = 'n', nowait = true, desc = 'Cut entry (move it by pasting)' },
+    ['i'] = { 'yy', mode = 'n', nowait = true, desc = 'Copy entry (copy it by pasting)' },
     ["_"] = {
         callback = function()
             local dir = require("oil").get_current_dir()
@@ -1248,6 +1289,34 @@ local function get_char_input()
     return ok and label or ''
 end
 
+-- Move to another line, marking both lines' outer edges so a then selects them whole (mark a on the line you left,
+-- mark b on the line you land on): going down, a = start of this line, b = end of that one; going up, the reverse.
+-- Start = first non-blank, end = last char (same as i copying a line). The cursor keeps its column.
+-- linewise: a then selects with V instead (used by gg / ge).
+local function jump_to_line(target_line, linewise)
+    local from_line = vim.fn.line('.')
+    local function set_edge(mark, line, at_end)
+        local col = at_end and last_char_col(line) or math.min(#vim.fn.getline(line):match('^%s*'), last_char_col(line))
+        vim.api.nvim_buf_set_mark(0, mark, line, col, {})
+    end
+    local down = target_line > from_line
+    set_edge('a', from_line, not down)
+    set_edge('b', target_line, down)
+    vim.fn.cursor(target_line, 0)
+    line_jump = { buf = vim.api.nvim_get_current_buf(), cursor = vim.api.nvim_win_get_cursor(0),
+                  mark_a = vim.api.nvim_buf_get_mark(0, 'a'), linewise = linewise }
+end
+
+-- gg / ge: go to the start / end of the file (a count picks the line instead, like 5gg), then a selects every line
+-- from the one you left to the one you landed on, as V would. Both stay in the jumplist, so gp takes you back.
+local function jump_to_file_edge(default_line)
+    local target = vim.v.count > 0 and math.min(vim.v.count, vim.fn.line('$')) or default_line
+    vim.cmd("normal! m'")
+    jump_to_line(target, true)
+end
+vim.keymap.set('n', 'gg', function() jump_to_file_edge(1) end, { silent = true, desc = 'Go to start of file' })
+vim.keymap.set('n', 'ge', function() jump_to_file_edge(vim.fn.line('$')) end, { silent = true, desc = 'Go to end of file' })
+
 -- Search up function
 local function searchUp()
     local input = get_char_input()
@@ -1257,7 +1326,7 @@ local function searchUp()
         local current_line = vim.fn.line('.')
         local target_line = current_line - distance
         if target_line >= 1 then
-            vim.fn.cursor(target_line, 0)
+            jump_to_line(target_line)
         end
     end
 end
@@ -1272,7 +1341,7 @@ local function searchDown()
         local target_line = current_line + distance
         local last_line = vim.fn.line('$')
         if target_line <= last_line then
-            vim.fn.cursor(target_line, 0)
+            jump_to_line(target_line)
         end
     end
 end
@@ -1604,6 +1673,7 @@ local quick_guide = {
     { 'kj / KJ',   '(insert) back to normal' },
     { 'fj / FJ',   '(visual) back to normal' },
     { '<S-Tab>',   '(insert) unindent' },
+    { '<leader>, / .', 'unindent / indent line' },
     { 'J',         'join lines (stay at start)' },
   } },
   { 'Move', {
@@ -1625,24 +1695,24 @@ local quick_guide = {
     { 'gk / gj', 'top / bottom of screen *' },
     { 'gh / gl', 'start / end of line *' },
     { 'g0',      'column 0 *' },
-    { 'ge',      'end of file *' },
+    { 'gg / ge', 'start / end of file *' },
     { "g'{m}",   'go to mark {m}' },
     { 'gp',      'back to previous position' },
     { 'gd',      'definition (LSP)' },
   } },
   { 'Select', {
-    { 'a',       'from mark a to cursor' },
+    { 'a',       'from mark a to cursor (after f / d / gg / ge: whole lines)' },
+    { '<leader>a', 'block select: mark a to cursor' },
     { 'w',       'word' },
-    { 'O',       'paragraph' },
     { 'v',       'last yanked / changed text' },
     { '( [ { <', 'inside brackets' },
-    { ') ]',     'around () / [] (with brackets)' },
+    { ') ] >',   'around () / [] / <> (with brackets)' },
     { "'",       "inside quotes (' or \")" },
     { '"',       'around quotes (with quotes)' },
     'all of these jump to the next pair if not in one',
     { '%',       'whole file' },
     { 'xf',      'function (top-level block)' },
-    { 'xp',      'function parameters' },
+    { 'xp',      'paragraph' },
     { 'xl',      'loop' },
     { 'xi',      'whole if / elif / else' },
     { 'xI',      'current if / elif / else branch' },
@@ -1650,7 +1720,7 @@ local quick_guide = {
   { 'Visual mode', {
     'g-keys, t / T, / ?, <leader>j / k also work',
     { 'i',            'copy' },
-    { 'p',            'paste (keeps register)' },
+    { 'p',            'paste over (keeps register; multi-line = whole lines)' },
     { 'e',            'delete' },
     { 'n',            'change' },
     { 'm{c}',         'replace every char with {c}' },
@@ -1666,7 +1736,7 @@ local quick_guide = {
     { 'ry',     'start of line → cursor' },
   } },
   { 'Paste', {
-    { 'p',             'over line' },
+    { 'p',             'over line (extra lines push the rest down)' },
     { 'b',             'over char' },
     { 'op / ob',       'right / left of char' },
     { 'rp / rb',       'after / before cursor' },
@@ -1683,6 +1753,7 @@ local quick_guide = {
   { 'Insert (paste new)', {
     { 'n',             'over line' },
     { 'm{c}',          'replace char with {c}' },
+    { 'M',             'replace mode (type over text)' },
     { 'on / om',       'after / before cursor' },
     { 'oN / oM',       'end / start of line' },
     { 'rn',            'over cursor → end of line' },
@@ -1704,6 +1775,7 @@ local quick_guide = {
   } },
   { 'Oil (file browser)', {
     { 'l / h', 'open / parent dir' },
+    { 'e / i', 'cut / copy entry (paste = move / copy)' },
     { '_',     'set cwd to this dir' },
     { 'q',     'quit nvim, remember dir' },
     { 'g?',    'all Oil keys' },
