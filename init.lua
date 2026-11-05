@@ -186,6 +186,15 @@ end, { silent = true, nowait = true })
 vim.api.nvim_set_keymap('n', 'w', 'viw', {noremap = true, silent = true})    -- select word
 vim.api.nvim_set_keymap('n', 'v', '`[v`]', {noremap = true, silent = true})     -- select previously selected thing  TODO make it work for the last pasted thing as well???
 vim.api.nvim_set_keymap('n', 'xp', 'vip', {noremap = true, silent = true})   -- select paragraph
+-- k straight after xp: keep the whole paragraph selected and carry on from the line above it, as if you'd selected it
+-- from its bottom line (o = swap to the other end of the selection). Press anything else first and k is just k.
+local just_did_xp = false
+vim.on_key(function(_, typed) -- (runs after k's function below has checked. sub: a <Nop> V can be joined on, as Vxp)
+  if typed ~= '' and not typed:match('^%d$') then just_did_xp = typed:sub(-2) == 'xp' end -- (a count is part of the k)
+end, vim.api.nvim_create_namespace('just_did_xp'))
+vim.keymap.set('x', 'k', function()
+  return just_did_xp and 'o' .. vim.v.count1 .. 'k' or 'k'
+end, { expr = true, silent = true })
 vim.api.nvim_set_keymap('n', '<leader>a', '<C-v>`a', {noremap = true, silent = true}) -- block-select from the mark to the current point
  
 -- selecting in-between
@@ -320,11 +329,25 @@ local function last_char_col(lnum)
   return #text - 1 + vim.str_utf_start(text, #text)
 end
 
+-- The register's text as whole lines. A single copied line with a newline at its end (or start) - e.g. v$ took the
+-- line break too - gives just that line, so pasting it doesn't add a blank line. Several lines are pasted as they are.
+local function register_lines(reg)
+  local lines = vim.fn.getreg(reg, 1, true)
+  if vim.fn.getregtype(reg) == 'v' then -- copied as text (V copies never hold the last newline in this list)
+    local first, last = 1, #lines
+    if lines[first] == '' and last > first then first = first + 1 end
+    if lines[last] == '' and last > first then last = last - 1 end
+    if first == last then return { lines[first] } end
+  end
+  return lines
+end
+
 -- Replace lines first..last with the register's lines (always whole lines), reindent them, and leave the register alone.
+-- last = first - 1 replaces nothing: the lines go in above line first (how <leader>p / <leader>b paste on a new line).
 local function paste_over_lines(first, last)
   local reg = vim.v.register
   if vim.fn.getreg(reg) == '' then return end
-  local lines = vim.fn.getreg(reg, 1, true)
+  local lines = register_lines(reg)
   vim.api.nvim_buf_set_lines(0, first - 1, last, true, lines)
   local new_last = first + #lines - 1
   vim.cmd('keepjumps normal! ' .. first .. 'G=' .. new_last .. 'G') -- reindent what was pasted
@@ -341,8 +364,9 @@ vim.api.nvim_set_keymap('n', 'op', 'a <Esc>vp==', {noremap = true, silent = true
 vim.api.nvim_set_keymap('n', 'ob', 'i <Esc>vp==', {noremap = true, silent = true, nowait = true})        -- create new char to left of current char | paste over that
 vim.api.nvim_set_keymap('n', 'rp', 'p', {noremap = true, silent = true, nowait = true})              -- select from current char to end of line | paste over that
 vim.api.nvim_set_keymap('n', 'rb', 'hp', {noremap = true, silent = true, nowait = true})              -- select from current char to start of line | paste over that
-vim.api.nvim_set_keymap('n', '<leader>p', 'o<Esc>p==', {noremap = true, silent = true, nowait = true}) -- create new line below | paste over that
-vim.api.nvim_set_keymap('n', '<leader>b', 'O<Esc>p==', {noremap = true, silent = true, nowait = true}) -- create new line above | paste over that
+-- create new line below / above | paste over that (the copied lines go in as new lines, with no extra blank line)
+vim.keymap.set('n', '<leader>p', function() local l = vim.fn.line('.'); paste_over_lines(l + 1, l) end, { silent = true, nowait = true })
+vim.keymap.set('n', '<leader>b', function() local l = vim.fn.line('.'); paste_over_lines(l, l - 1) end, { silent = true, nowait = true })
  
 -- pasting empty (deleting)  (empty and umpty?)
 vim.api.nvim_set_keymap('n', 'e', '^d$"_dd', {noremap = true, silent = true, nowait = true})           -- select current line | paste nothing over top (delete the line)
@@ -676,8 +700,8 @@ vim.api.nvim_set_keymap('n', 'J', 'J0', {noremap = true, silent = true})
 vim.api.nvim_set_keymap('i', '<S-Tab>', '<C-d>', { noremap = true, silent = true })
  
 -- Stay in indent mode
-vim.api.nvim_set_keymap('x', '<', '<gv', { noremap = true })
-vim.api.nvim_set_keymap('x', '>', '>gv', { noremap = true })
+vim.api.nvim_set_keymap('x', '<leader>,', '<gv', { noremap = true, silent = true }) -- unindent selection (like <leader>, in normal mode)
+vim.api.nvim_set_keymap('x', '<leader>.', '>gv', { noremap = true, silent = true }) -- indent selection (like <leader>. in normal mode)
  
 -- User <leader>r to replace the word underneath the cursor (need to use /c manually for confirmation ;
 -- for confirm options: q = skip to next file ; a = replace all in current file,q ; l = y, q; <scrolling options> )
@@ -909,6 +933,58 @@ end
 --                                                                                                   File navigation
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
+-- l in oil plays / shows media files instead of opening them as text. Each extension maps to a kind.
+local media_kinds = {}
+for kind, exts in pairs({
+  audio = { 'mp3', 'flac', 'wav', 'ogg', 'opus', 'm4a', 'aac', 'wma', 'aiff' },
+  video = { 'mp4', 'mkv', 'webm', 'mov', 'avi', 'm4v', 'wmv', 'flv', 'mpg', 'mpeg', 'ogv', '3gp' },
+  image = { 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tif', 'tiff', 'ico', 'avif', 'heic' },
+}) do
+  for _, ext in ipairs(exts) do media_kinds[ext] = kind end
+end
+
+-- Video plays in ffplay (a bare window: space pause, arrows seek, f fullscreen, q quit). Images open in ristretto.
+-- Either one missing: the system's default app opens the file.
+local media_apps = { video = { 'ffplay', '-autoexit', '-loglevel', 'quiet' }, image = { 'ristretto' } }
+
+-- Audio plays inside nvim: VLC's terminal player in a 6 line split at the bottom (space pause, left / right seek,
+-- a / z volume, q stop). The split closes when the song ends or stops. A new song replaces the one playing.
+local audio_buf = nil -- terminal buffer of the song playing
+
+-- Close the player's split and stop its song (deleting a terminal buffer ends its job). The window is closed first:
+-- deleting the buffer alone would leave an empty window behind when no listed buffers are open (e.g. `nvim .`).
+local function close_audio(buf)
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do pcall(vim.api.nvim_win_close, win, true) end
+  if vim.api.nvim_buf_is_valid(buf) then vim.api.nvim_buf_delete(buf, { force = true }) end
+end
+
+local function play_audio(path)
+  if vim.fn.executable('vlc') == 0 then return vim.ui.open(path) end
+  if audio_buf then close_audio(audio_buf) end
+  local buf = vim.api.nvim_create_buf(false, true)
+  local win = vim.api.nvim_open_win(buf, true, { split = 'below', win = -1, height = 6 })
+  vim.wo[win].number, vim.wo[win].relativenumber, vim.wo[win].signcolumn = false, false, 'no'
+  vim.fn.jobstart({ 'vlc', '-I', 'ncurses', '--quiet', '--no-video', '--play-and-exit', path }, {
+    term = true,
+    on_exit = function() vim.schedule(function() close_audio(buf) end) end,
+  })
+  audio_buf = buf
+  vim.cmd.startinsert() -- keys go straight to the player
+end
+
+-- Media files play / show (see above). Folders and every other file open as normal.
+local function oil_open()
+  local oil = require('oil')
+  local entry, dir = oil.get_cursor_entry(), oil.get_current_dir()
+  local path = entry and dir and dir .. entry.name
+  local kind = path and vim.fn.filereadable(path) == 1 and media_kinds[(entry.name:match('%.([^.]+)$') or ''):lower()]
+  if not kind then return require('oil.actions').select.callback() end
+  if kind == 'audio' then return play_audio(path) end
+  local app = media_apps[kind]
+  if vim.fn.executable(app[1]) == 0 then return vim.ui.open(path) end
+  vim.system(vim.list_extend(vim.deepcopy(app), { path }), { detach = true, stdout = false, stderr = false })
+end
+
 require("oil").setup({
   -- Oil will take over directory buffers (e.g. `vim .` or `:e src/`)
   -- Set to false if you want some other plugin (e.g. netrw) to open when you edit directories.
@@ -988,7 +1064,7 @@ require("oil").setup({
     ["g\\"] = "actions.toggle_trash",
 
     -- Add your custom remappings here
-    ['l'] = 'actions.select', -- Go into folder / open file
+    ['l'] = { callback = oil_open, mode = 'n', desc = 'Go into folder / open file (media plays / shows)' },
     ['h'] = 'actions.parent',   -- Go back up a level
     -- e / i take the whole line (like Vd / Vy), not just the name. The line holds oil's hidden entry id, so pasting it
     -- into an oil buffer moves (e) or copies (i) the actual file / folder, not just its name.
@@ -1712,7 +1788,7 @@ local quick_guide = {
     'all of these jump to the next pair if not in one',
     { '%',       'whole file' },
     { 'xf',      'function (top-level block)' },
-    { 'xp',      'paragraph' },
+    { 'xp',      'paragraph (k straight after: carry on up from above it)' },
     { 'xl',      'loop' },
     { 'xi',      'whole if / elif / else' },
     { 'xI',      'current if / elif / else branch' },
@@ -1727,7 +1803,7 @@ local quick_guide = {
     { 'f{l} / d{l}',  'extend down / up to line' },
     { '<leader>s{c}', 'to char →' },
     { '<leader>S{c}', 'to char ←' },
-    { '< / >',        'indent (keep selection)' },
+    { '<leader>, / .', 'unindent / indent (keep selection)' },
   } },
   { 'Copy', {
     { 'i',      'line' },
@@ -1775,6 +1851,8 @@ local quick_guide = {
   } },
   { 'Oil (file browser)', {
     { 'l / h', 'open / parent dir' },
+    '  l on audio / video / image plays / shows it',
+    '  audio: space pause, ←/→ seek, a/z vol, q stop',
     { 'e / i', 'cut / copy entry (paste = move / copy)' },
     { '_',     'set cwd to this dir' },
     { 'q',     'quit nvim, remember dir' },
@@ -2007,88 +2085,154 @@ end, { desc = 'Toggle mappings quick-guide' })
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------
 --                                                                                                   Key stats (~/.vimstats)
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- Counts how often you use each key combo outside insert mode - e.g. e, s, <leader>f, gg, ci( - and keeps
--- ~/.vimstats sorted, most used first. What you type *for* a command isn't counted as a combo of its own:
--- the letter after s / t, line labels, the char after m, counts like the 3 in 3j, and anything typed in
--- insert mode or on the : command line. Visual-mode combos are listed separately, e.g. "e (visual)".
+-- Counts how often you press each key combo outside insert mode - e.g. e, s, <leader>f, gg, ci( - and keeps ~/.vimstats
+-- sorted, most used first. Normal mode, oil, visual mode and visual mode inside oil each get their own section.
+-- Only key presses count, as you pressed them:
+--   - What you type *for* a command isn't a combo of its own: the letter after s / t, line labels, the char after m,
+--     counts like the 3 in 3j, and anything typed in insert mode or on the : command line.
+--   - A prefix key (<Space>, o, r ...) is never counted alone, it goes with the key after it. Neovim runs them as two
+--     separate commands if you pause for over 'timeoutlen' or the pair isn't mapped, but you still pressed <leader>l.
+--   - An Alt chord that isn't mapped is counted as <M-j>. Neovim runs it as <Esc> then j, but you didn't press <Esc>.
+--   - , is shown as <comma>, to tell it apart from the comma at the end of each combo in the file.
 -- The file is updated every 10 seconds and on exit; every open Neovim adds to the same file.
 local stats_file = vim.fn.expand('~/.vimstats')
-local stats_pending = {}     -- combo -> uses since the file was last written
-local stats_cmd = nil        -- the combo being typed: { keys = 'g', visual = false, wants = 'more' | 'char' | nil }
+local stats_sections = { 'normal', 'oil', 'visual', 'oil visual' } -- in the order they're listed in the file
+local stats_pending = {}     -- section -> combo -> uses since the file was last written
+local stats_cmd = nil        -- the combo being typed: { keys = 'g', section = 'normal', map_mode = 'n', wants = 'more' | 'char' | nil }
 local stats_counting = false -- in the middle of a count (the 3 in 3j)
+local stats_alt_mode = nil   -- the mode an Alt chord was pressed in, while waiting for its key to arrive after the <Esc>
+-- Built-in commands that read one more key: a mark / register / letter, which isn't a combo of its own
+local stats_char_keys = { ['`'] = true, ["'"] = true, ['"'] = true, ['@'] = true, m = true, r = true, f = true, F = true, t = true, T = true }
+
+local function stats_add(counts, section, combo, n)
+  counts[section] = counts[section] or {}
+  counts[section][combo] = (counts[section][combo] or 0) + n
+end
 
 local function stats_commit()
   local cmd = stats_cmd
   stats_cmd = nil
-  if not cmd then return end
-  local combo = cmd.keys .. (cmd.visual and ' (visual)' or '')
-  stats_pending[combo] = (stats_pending[combo] or 0) + 1
+  if not cmd or cmd.wants == 'more' then return end -- (never finished: you quit straight after a prefix key)
+  local combo = cmd.keys:gsub('^<Space>', '<leader>'):gsub('<lt>', '<'):gsub(',', '<comma>')
+  stats_add(stats_pending, cmd.section, combo, 1)
 end
 
-vim.on_key(function(_, typed)
-  if typed == '' or jumping then return end -- keys produced by mappings, or a jump's letter / label
-  local key = vim.fn.keytrans(typed):gsub('<lt>', '<')
-  if key:match('Mouse') or key:match('ScrollWheel') or key:match('^<Focus') or key:match('Paste') then return end
-  local mode = vim.api.nvim_get_mode().mode
+-- What these keys still need: 'more' = the next key is part of the combo (gg, za, <C-W>v, or a prefix key like <Space> / o),
+-- 'char' = the next key is just a mark / register / letter, nil = they're a whole combo.
+local function stats_wants(keys, map_mode)
+  local map = vim.fn.maparg(keys, map_mode, false, true)
+  if next(map) then return stats_char_keys[map.rhs] and 'char' or nil end -- (m -> r and g' -> ' still read one more key)
+  if keys == 'g' or keys == 'z' or keys == 'Z' or keys == '<C-W>' or vim.fn.mapcheck(keys, map_mode) ~= '' then return 'more' end
+  if stats_char_keys[keys] or (keys == 'q' and vim.fn.reg_recording() == '') then return 'char' end
+  return nil
+end
+
+-- typed is usually one combo, but a mapping that produces no keys of its own (V -> <Nop>) gets joined on to whatever
+-- you press next ("Vj"). So split it up: at each key take the longest mapping that starts there, or else just that key.
+local function stats_split(typed, map_mode)
+  local keys, i = {}, 1
+  while i <= #typed do
+    local key = typed:match('^<[^<>]+>', i) or typed:sub(i, i + vim.str_utf_end(typed, i))
+    if not (key:match('Mouse') or key:match('Drag>') or key:match('Release>') or key:match('ScrollWheel')
+      or key:match('^<Focus') or key:match('Paste')) then -- only the keyboard counts
+      table.insert(keys, key)
+    end
+    i = i + #key
+  end
+  local combos, first = {}, 1
+  while first <= #keys do
+    local last = #keys
+    while last > first and not next(vim.fn.maparg(table.concat(keys, '', first, last), map_mode, false, true)) do
+      last = last - 1
+    end
+    table.insert(combos, table.concat(keys, '', first, last))
+    first = last + 1
+  end
+  return combos
+end
+
+local function stats_press(keys, mode)
+  local cmd = stats_cmd
+  if cmd and cmd.wants == 'more' then -- whatever mode that key landed in (o then n, after a pause, is in insert mode by now)
+    cmd.keys = cmd.keys .. keys
+    cmd.wants = stats_wants(cmd.keys, cmd.map_mode)
+    return
+  end
+  if cmd and cmd.wants == 'char' then
+    cmd.wants = nil
+    return
+  end
   if mode:match('^no') then -- an operator waiting for its motion (ci( , dw): same combo
-    if stats_cmd then stats_cmd.keys = stats_cmd.keys .. key end
+    if cmd then cmd.keys = cmd.keys .. keys end
     return
   end
-  if not (mode:match('^n') or mode:match('^[vV\22]')) then return end -- insert, replace, command line, prompts
-  if stats_cmd and stats_cmd.wants == 'more' then -- 2nd key of a g / z / Z / <C-W> command (gg, za, <C-W>v)
-    stats_cmd.keys, stats_cmd.wants = stats_cmd.keys .. key, nil
-    return
-  end
-  if stats_cmd and stats_cmd.wants == 'char' then -- the mark / register after g' ` q @
-    stats_cmd.wants = nil
-    return
-  end
-  if key:match('^%d$') and (stats_counting or key ~= '0') then -- counts aren't combos (a lone 0 is)
+  if not mode:match('^[nvV\22]') then return end -- insert, replace, command line, prompts
+  if keys:match('^%d$') and (stats_counting or keys ~= '0') then -- counts aren't combos (a lone 0 is)
     stats_counting = true
     return
   end
   stats_counting = false
   stats_commit() -- a new combo starts, so the previous one is complete
 
-  local mapped = next(vim.fn.maparg(key, mode:match('^n') and 'n' or 'x', false, true)) ~= nil
-  local wants = nil
-  if key == "g'" then
-    wants = 'char'
-  elseif not mapped then
-    if key == 'g' or key == 'z' or key == 'Z' or key == '<C-W>' then
-      wants = 'more'
-    elseif key == '`' or key == '@' or (key == 'q' and vim.fn.reg_recording() == '') then
-      wants = 'char'
-    end
+  local visual = not mode:match('^n')
+  local section = visual and 'visual' or 'normal'
+  if vim.bo.filetype == 'oil' then section = visual and 'oil visual' or 'oil' end
+  local map_mode = visual and 'x' or 'n'
+  stats_cmd = { keys = keys, section = section, map_mode = map_mode, wants = stats_wants(keys, map_mode) }
+end
+
+vim.on_key(function(_, typed)
+  if typed == '' or jumping then return end -- keys produced by mappings, or a jump's letter / label
+  local key = vim.fn.keytrans(typed)
+  local mode = vim.api.nvim_get_mode().mode
+  if key == '<Esc>' and vim.fn.getchar(1) ~= 0 then -- its key is already queued, so this is an Alt chord (a real <Esc> is alone)
+    stats_alt_mode = mode
+    return
   end
-  if mapped and vim.g.mapleader == ' ' and key:match('^<Space>.') then key = '<leader>' .. key:sub(8) end
-  stats_cmd = { keys = key, visual = not mode:match('^n'), wants = wants }
+  if stats_alt_mode then
+    key, mode, stats_alt_mode = '<M-' .. (key:match('^<(.+)>$') or key) .. '>', stats_alt_mode, nil
+  end
+  for _, combo in ipairs(stats_split(key, mode:match('^[vV\22]') and 'x' or 'n')) do stats_press(combo, mode) end
 end, vim.api.nvim_create_namespace('key_stats'))
 
 -- Add the new counts to the file (re-reading it first, so several Neovims don't overwrite each other)
 local function stats_write()
   if next(stats_pending) == nil then return end
-  local counts = {}
+  local counts, section = {}, nil
   local f = io.open(stats_file, 'r')
   if f then
     for line in f:lines() do
+      local header = line:match('^## (.+)$')
       local combo, n = line:match('^(.-),%s+(%d+)%s*$')
-      if combo and combo ~= '' then counts[combo] = (counts[combo] or 0) + tonumber(n) end
+      if header then
+        section = header
+      elseif section and combo and combo ~= '' then
+        stats_add(counts, section, combo, tonumber(n))
+      end
     end
     f:close()
   end
-  for combo, n in pairs(stats_pending) do counts[combo] = (counts[combo] or 0) + n end
+  for name, combos in pairs(stats_pending) do
+    for combo, n in pairs(combos) do stats_add(counts, name, combo, n) end
+  end
   stats_pending = {}
 
-  local list, width = {}, 0
-  for combo, n in pairs(counts) do
-    table.insert(list, { combo, n })
-    width = math.max(width, vim.fn.strdisplaywidth(combo))
+  local width = 0
+  for _, combos in pairs(counts) do
+    for combo in pairs(combos) do width = math.max(width, vim.fn.strdisplaywidth(combo)) end
   end
-  table.sort(list, function(a, b) return a[2] > b[2] or (a[2] == b[2] and a[1] < b[1]) end)
   local out = {}
-  for _, e in ipairs(list) do -- "e,          204983": numbers lined up 2 spaces after the longest combo
-    table.insert(out, e[1] .. ',' .. string.rep(' ', width - vim.fn.strdisplaywidth(e[1]) + 2) .. e[2])
+  for _, name in ipairs(stats_sections) do
+    if counts[name] then
+      local list = {}
+      for combo, n in pairs(counts[name]) do table.insert(list, { combo, n }) end
+      table.sort(list, function(a, b) return a[2] > b[2] or (a[2] == b[2] and a[1] < b[1]) end)
+      if #out > 0 then table.insert(out, '') end
+      table.insert(out, '## ' .. name)
+      for _, e in ipairs(list) do -- "e,          204983": numbers lined up 2 spaces after the longest combo
+        table.insert(out, e[1] .. ',' .. string.rep(' ', width - vim.fn.strdisplaywidth(e[1]) + 2) .. e[2])
+      end
+    end
   end
   local tmp = stats_file .. '.tmp' .. vim.fn.getpid() -- write then rename, so the file is never half-written
   local w = io.open(tmp, 'w')

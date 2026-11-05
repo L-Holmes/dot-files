@@ -1,5 +1,0 @@
-after f: { 14, 0 }
-mark a: { 14, 0 }
-mode: v
-yanked: "l"
-ok=true err=nil
