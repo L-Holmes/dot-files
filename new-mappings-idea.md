@@ -1,3 +1,62 @@
+j,              move down
+k,              move up
+l,              move right
+f,              move left
+d,              save
+s,              newline below + insert
+;,              delete line
+a,              file explorer   (or quit file explorer if in oil)
+i,              sneak down to line...            
+e,              select from mark to current point
+<space>, k      search                           
+<space>, j      newline below + paste            
+<space>, l      undo                             
+<space>, d      paste over current line          
+<space>, f      go to end of line                
+<space>, s      go to end of document            
+<space>, ;      
+<space>, a      
+<space>i,
+<space>e,
+o,
+w,
+u,
+n,
+r,
+v,
+m,
+h,
+p,
+g,
+t,
+<comma>,
+.,
+y,
+c,
+b,
+x,
+',
+/,
+,z,
+-,
+q,#,
+[,],
+9,
+3,
+8,
+4,
+0,
+2,
+7,
+5,
+6,
+1,
+=,
+`,
+\,
+
+
+
 
 do i make things on the home row leader keys ?!?!?!?!?!
 or not ?!?!?!?
