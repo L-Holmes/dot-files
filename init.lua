@@ -2094,10 +2094,15 @@ end, { desc = 'Toggle mappings quick-guide' })
 --     separate commands if you pause for over 'timeoutlen' or the pair isn't mapped, but you still pressed <leader>l.
 --   - An Alt chord that isn't mapped is counted as <M-j>. Neovim runs it as <Esc> then j, but you didn't press <Esc>.
 --   - , is shown as <comma>, to tell it apart from the comma at the end of each combo in the file.
--- The file is updated every 10 seconds and on exit; every open Neovim adds to the same file.
+-- Keys typed in insert mode go to ~/typingstats instead, one count per key (e, <Space>, <BS>, <C-w> ...), in the same format.
+-- kj / KJ (or any insert mapping to <Esc>) isn't counted there, so it doesn't pad out k and j. A real <Esc> is.
+-- The files are updated every 10 seconds and on exit; every open Neovim adds to the same files.
 local stats_file = vim.fn.expand('~/.vimstats')
 local stats_sections = { 'normal', 'oil', 'visual', 'oil visual' } -- in the order they're listed in the file
 local stats_pending = {}     -- section -> combo -> uses since the file was last written
+local typing_file = vim.fn.expand('~/typingstats')
+local typing_sections = { 'insert' }
+local typing_pending = {}    -- same as stats_pending, for ~/typingstats
 local stats_cmd = nil        -- the combo being typed: { keys = 'g', section = 'normal', map_mode = 'n', wants = 'more' | 'char' | nil }
 local stats_counting = false -- in the middle of a count (the 3 in 3j)
 local stats_alt_mode = nil   -- the mode an Alt chord was pressed in, while waiting for its key to arrive after the <Esc>
@@ -2127,9 +2132,8 @@ local function stats_wants(keys, map_mode)
   return nil
 end
 
--- typed is usually one combo, but a mapping that produces no keys of its own (V -> <Nop>) gets joined on to whatever
--- you press next ("Vj"). So split it up: at each key take the longest mapping that starts there, or else just that key.
-local function stats_split(typed, map_mode)
+-- The keys in typed, one by one, leaving out the mouse / focus / paste events
+local function stats_keys(typed)
   local keys, i = {}, 1
   while i <= #typed do
     local key = typed:match('^<[^<>]+>', i) or typed:sub(i, i + vim.str_utf_end(typed, i))
@@ -2139,6 +2143,13 @@ local function stats_split(typed, map_mode)
     end
     i = i + #key
   end
+  return keys
+end
+
+-- typed is usually one combo, but a mapping that produces no keys of its own (V -> <Nop>) gets joined on to whatever
+-- you press next ("Vj"). So split it up: at each key take the longest mapping that starts there, or else just that key.
+local function stats_split(typed, map_mode)
+  local keys = stats_keys(typed)
   local combos, first = {}, 1
   while first <= #keys do
     local last = #keys
@@ -2192,14 +2203,22 @@ vim.on_key(function(_, typed)
   if stats_alt_mode then
     key, mode, stats_alt_mode = '<M-' .. (key:match('^<(.+)>$') or key) .. '>', stats_alt_mode, nil
   end
+  -- typing, unless the key belongs to a normal mode combo (o, a pause, then n: "on") or it's kj -> <Esc> (arrives as one "kj")
+  local typing = mode:match('^i') and not (stats_cmd and stats_cmd.wants)
+    and vim.fn.maparg(key, 'i'):lower() ~= '<esc>'
   for _, combo in ipairs(stats_split(key, mode:match('^[vV\22]') and 'x' or 'n')) do stats_press(combo, mode) end
+  if typing then
+    for _, k in ipairs(stats_keys(key)) do
+      stats_add(typing_pending, 'insert', (k:gsub('<lt>', '<'):gsub(',', '<comma>')), 1)
+    end
+  end
 end, vim.api.nvim_create_namespace('key_stats'))
 
 -- Add the new counts to the file (re-reading it first, so several Neovims don't overwrite each other)
-local function stats_write()
-  if next(stats_pending) == nil then return end
+local function stats_write(file, sections, pending)
+  if next(pending) == nil then return end
   local counts, section = {}, nil
-  local f = io.open(stats_file, 'r')
+  local f = io.open(file, 'r')
   if f then
     for line in f:lines() do
       local header = line:match('^## (.+)$')
@@ -2212,17 +2231,17 @@ local function stats_write()
     end
     f:close()
   end
-  for name, combos in pairs(stats_pending) do
+  for name, combos in pairs(pending) do
     for combo, n in pairs(combos) do stats_add(counts, name, combo, n) end
+    pending[name] = nil
   end
-  stats_pending = {}
 
   local width = 0
   for _, combos in pairs(counts) do
     for combo in pairs(combos) do width = math.max(width, vim.fn.strdisplaywidth(combo)) end
   end
   local out = {}
-  for _, name in ipairs(stats_sections) do
+  for _, name in ipairs(sections) do
     if counts[name] then
       local list = {}
       for combo, n in pairs(counts[name]) do table.insert(list, { combo, n }) end
@@ -2234,17 +2253,22 @@ local function stats_write()
       end
     end
   end
-  local tmp = stats_file .. '.tmp' .. vim.fn.getpid() -- write then rename, so the file is never half-written
+  local tmp = file .. '.tmp' .. vim.fn.getpid() -- write then rename, so the file is never half-written
   local w = io.open(tmp, 'w')
   if not w then return end
   w:write(table.concat(out, '\n') .. '\n')
   w:close()
-  os.rename(tmp, stats_file)
+  os.rename(tmp, file)
+end
+
+local function stats_save()
+  stats_write(stats_file, stats_sections, stats_pending)
+  stats_write(typing_file, typing_sections, typing_pending)
 end
 
 local stats_timer = vim.uv.new_timer()
-stats_timer:start(10000, 10000, vim.schedule_wrap(stats_write))
+stats_timer:start(10000, 10000, vim.schedule_wrap(stats_save))
 vim.api.nvim_create_autocmd('VimLeavePre', {
-  callback = function() stats_commit(); stats_write() end,
-  desc = 'Save key stats to ~/.vimstats',
+  callback = function() stats_commit(); stats_save() end,
+  desc = 'Save key stats to ~/.vimstats and ~/typingstats',
 })
