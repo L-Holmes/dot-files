@@ -2094,18 +2094,36 @@ end, { desc = 'Toggle mappings quick-guide' })
 --     separate commands if you pause for over 'timeoutlen' or the pair isn't mapped, but you still pressed <leader>l.
 --   - An Alt chord that isn't mapped is counted as <M-j>. Neovim runs it as <Esc> then j, but you didn't press <Esc>.
 --   - , is shown as <comma>, to tell it apart from the comma at the end of each combo in the file.
--- Keys typed in insert mode go to ~/typingstats instead, one count per key (e, <Space>, <BS>, <C-w> ...), in the same format.
+--   - : is counted with the command you ran: :q, :set wrap, :'<,'>sort (written as you typed it, commas and all).
+--     Cancelled or empty, it's just :. A mapping that runs a : command (<leader>l -> :wa) is counted as the mapping.
+-- Keys typed in insert mode go to ~/.typingstats instead, one count per key, in the same format. Special keys are spelled
+-- out to be easy to read: <backspace>, <enter>, <space>, <tab>, <escape>, <ctrl-w>, <alt-j>, <shift-tab> ...
 -- kj / KJ (or any insert mapping to <Esc>) isn't counted there, so it doesn't pad out k and j. A real <Esc> is.
+-- ~/.prevletterstats lists, for each key typed in insert mode, the key typed just before it, most common first. The first
+-- key after entering insert mode has no key before it, so it isn't listed. kj / KJ isn't counted here either.
+-- In both, a capital letter counts as its lowercase letter: A is a, <alt-J> is <alt-j>.
+-- ~/.spelledwrongstats lists the words you misspell, most misspelled first, each with the ways you misspelled it
+-- (see "Misspellings" below for how they're spotted).
+-- ~/.wordstats lists the words you type, most typed first, with how many times: "the  4327". A word counts once you finish
+-- it (space, punctuation, <CR>, kj / <Esc>), if you typed at least one letter of it - so A<Space> after an old word, or
+-- splitting a word in two, doesn't count it. Like ~/.spelledwrongstats, only file buffers count, and words are lowercased.
 -- The files are updated every 10 seconds and on exit; every open Neovim adds to the same files.
 local stats_file = vim.fn.expand('~/.vimstats')
 local stats_sections = { 'normal', 'oil', 'visual', 'oil visual' } -- in the order they're listed in the file
 local stats_pending = {}     -- section -> combo -> uses since the file was last written
-local typing_file = vim.fn.expand('~/typingstats')
+local typing_file = vim.fn.expand('~/.typingstats')
 local typing_sections = { 'insert' }
-local typing_pending = {}    -- same as stats_pending, for ~/typingstats
-local stats_cmd = nil        -- the combo being typed: { keys = 'g', section = 'normal', map_mode = 'n', wants = 'more' | 'char' | nil }
+local typing_pending = {}    -- same as stats_pending, for ~/.typingstats
+local prev_file = vim.fn.expand('~/.prevletterstats')
+local prev_pending = {}      -- key -> the key typed before it -> uses, for ~/.prevletterstats
+local prev_key = nil         -- the last key typed in insert mode (nil until you type one)
+local spelled_file = vim.fn.expand('~/.spelledwrongstats')
+local spelled_pending = {}   -- word -> how you misspelled it (wh-ther) -> times, for ~/.spelledwrongstats
+local words_file = vim.fn.expand('~/.wordstats')
+local words_pending = {}     -- word -> times typed, for ~/.wordstats
+local stats_cmd = nil       -- the combo being typed: { keys = 'g', section = 'normal', map_mode = 'n', wants = 'more' | 'char' | nil }
+                             -- (and after :, ex = the command it ran, or false if there wasn't one)
 local stats_counting = false -- in the middle of a count (the 3 in 3j)
-local stats_alt_mode = nil   -- the mode an Alt chord was pressed in, while waiting for its key to arrive after the <Esc>
 -- Built-in commands that read one more key: a mark / register / letter, which isn't a combo of its own
 local stats_char_keys = { ['`'] = true, ["'"] = true, ['"'] = true, ['@'] = true, m = true, r = true, f = true, F = true, t = true, T = true }
 
@@ -2118,9 +2136,21 @@ local function stats_commit()
   local cmd = stats_cmd
   stats_cmd = nil
   if not cmd or cmd.wants == 'more' then return end -- (never finished: you quit straight after a prefix key)
-  local combo = cmd.keys:gsub('^<Space>', '<leader>'):gsub('<lt>', '<'):gsub(',', '<comma>')
+  local combo = cmd.ex and ':' .. cmd.ex or cmd.keys:gsub('^<Space>', '<leader>'):gsub('<lt>', '<')
+    :gsub('%-,>', '-comma>'):gsub(',', '<comma>') -- (<M-,> -> <M-comma>, not <M-<comma>>)
   stats_add(stats_pending, cmd.section, combo, 1)
 end
+
+-- When a : you typed runs a command, remember it, so it's counted as :q / :set wrap rather than just :
+vim.api.nvim_create_autocmd('CmdlineLeave', {
+  callback = function()
+    local cmd = stats_cmd
+    if vim.v.event.cmdtype ~= ':' or not cmd or cmd.keys ~= ':' or cmd.ex ~= nil then return end
+    local line = vim.trim(vim.fn.getcmdline()):gsub('%c', vim.fn.keytrans) -- (a typed <C-V><Tab> -> <Tab>, to keep it on one line)
+    cmd.ex = not vim.v.event.abort and line ~= '' and line or false
+  end,
+  desc = 'Count the : command you ran in ~/.vimstats',
+})
 
 -- What these keys still need: 'more' = the next key is part of the combo (gg, za, <C-W>v, or a prefix key like <Space> / o),
 -- 'char' = the next key is just a mark / register / letter, nil = they're a whole combo.
@@ -2192,83 +2222,413 @@ local function stats_press(keys, mode)
   stats_cmd = { keys = keys, section = section, map_mode = map_mode, wants = stats_wants(keys, map_mode) }
 end
 
+-- A key's name for ~/.typingstats: <BS> -> <backspace>, <C-W> -> <ctrl-w>, <M-j> -> <alt-j>, <lt> -> <, , -> <comma>, A -> a
+local typing_mods = { C = 'ctrl', M = 'alt', A = 'alt', S = 'shift', D = 'cmd', T = 'meta' }
+local typing_names = { BS = 'backspace', CR = 'enter', kEnter = 'enter', NL = 'ctrl-j', Esc = 'escape', Del = 'delete',
+  kDel = 'delete', Bar = '|', Bslash = '\\', lt = '<', [','] = 'comma' }
+local function typing_name(key)
+  local inner = key:match('^<(.+)>$')
+  if not inner then return key == ',' and '<comma>' or vim.fn.tolower(key) end
+  local mods = {}
+  while inner:match('^%a%-.') and typing_mods[inner:sub(1, 1)] do
+    table.insert(mods, typing_mods[inner:sub(1, 1)])
+    inner = inner:sub(3)
+  end
+  local name = typing_names[inner] or vim.fn.tolower(inner)
+  if #mods == 0 and #name == 1 then return name end -- <lt> -> <, <Bar> -> |
+  table.insert(mods, name)
+  return '<' .. table.concat(mods, '-') .. '>'
+end
+
+-- Misspellings (~/.spelledwrongstats). A word is checked when you finish it - with a space, punctuation, <CR>, kj / <Esc> -
+-- and counts as misspelled if, while typing it, you:
+--   - backspaced part of it, then typed the rest again: whtheth -> wh -> whether. It's logged as the part you had right,
+--     then what you'd typed wrong after it: wh-theth. Typed wrong more than once (whth -> wh -> whethr -> wheth -> whether),
+--     only the first try counts. Backspacing without typing anything new (whethere -> whether) doesn't count.
+--   - or deleted all of it (backspace, <C-w>), then typed a word that looks like it was meant to be the same one:
+--     rnfosedhusse -> roundhouse. It's logged whole. To look like the same word it has to start with the same letter and be
+--     at least spelled_alike alike (below), so fbasolutyl -> certainly is just a different word.
+-- Either way, if what you typed first is a real word (to Neovim's spell checker, in 'spelllang') you changed your mind,
+-- you didn't misspell it - running -> runs, thing -> think - so it isn't logged. Nor if it was only the start of the word
+-- (whe -> whether). Only file buffers count (not prompts, oil ...), and words are counted in lowercase.
+local spelled_alike = 0.7 -- how alike (0 - 1) a deleted word and the one typed instead must be, to be the same word
+local spelled_letters = "[%a'\128-\255]" -- what words are made of: letters, accented letters (é), and ' (don't)
+local spelled_word = {}   -- the word being typed: row, col (where it starts), text (as it was before the last key),
+                          -- first (how it was when you first backspaced into it), fixed (you've typed more since),
+                          -- tries (each go you deleted whole, oldest first), typed (you've added to it at all)
+-- Keys that finish a word, along with any other key that types something that isn't a letter: . , ! 1 ...
+local spelled_ends = { ['<Space>'] = true, ['<CR>'] = true, ['<kEnter>'] = true, ['<NL>'] = true, ['<Tab>'] = true,
+  ['<Esc>'] = true, ['<C-C>'] = true, ['<lt>'] = true, ['<Bar>'] = true, ['<Bslash>'] = true }
+
+local function spelled_chars(text) return vim.fn.split(text, [[\zs]]) end
+local function spelled_strip(text) return (text:gsub("^'+", ''):gsub("'+$", '')) end -- quotes around it: 'word'
+
+-- How alike two words look, 0 to 1 (Jaro-Winkler, made for catching typos in names): the letters they share - each found
+-- in about the same place in both, within half the longer word - less a little for shared letters that are out of order
+-- (teh / the), plus a bonus for starting the same (up to 4 letters). rnfosedhusse / roundhouse is 0.71, teh / the 0.9.
+local function spelled_likeness(a, b)
+  a, b = spelled_chars(a), spelled_chars(b)
+  local reach = math.max(1, math.floor(math.max(#a, #b) / 2) - 1) -- (at least 1, so a swap in a short word is found)
+  local taken, shared = {}, {} -- b's letters that are matched, and a's matched letters in order
+  for i, ch in ipairs(a) do
+    for j = math.max(1, i - reach), math.min(#b, i + reach) do
+      if not taken[j] and b[j] == ch then
+        taken[j] = true
+        table.insert(shared, ch)
+        break
+      end
+    end
+  end
+  local m = #shared
+  if m == 0 then return 0 end
+  local swapped, k = 0, 0 -- shared letters in a different order in b
+  for j = 1, #b do
+    if taken[j] then
+      k = k + 1
+      if b[j] ~= shared[k] then swapped = swapped + 1 end
+    end
+  end
+  local jaro = (m / #a + m / #b + (m - swapped / 2) / m) / 3
+  local same = 0
+  while same < 4 and a[same + 1] ~= nil and a[same + 1] == b[same + 1] do same = same + 1 end
+  return jaro + same * 0.1 * (1 - jaro)
+end
+
+-- A word Neovim's spell checker knows, as you typed it
+local function spelled_real(text)
+  local ok, bad = pcall(vim.spell.check, text)
+  if not ok then return false end
+  for _, e in ipairs(bad) do
+    if e[2] == 'bad' then return false end -- (not 'rare' / 'local' / 'caps': those are still words)
+  end
+  return true
+end
+
+-- A finished word: log it if you misspelled it on the way
+local function spelled_check(w)
+  local word = vim.fn.tolower(spelled_strip(w.text))
+  if word == '' then return end
+  for _, try in ipairs(w.tries) do -- you deleted it all, then typed it again
+    try = spelled_strip(try)
+    local low = vim.fn.tolower(try)
+    if low ~= '' and word:sub(1, #low) ~= low and vim.fn.strcharpart(low, 0, 1) == vim.fn.strcharpart(word, 0, 1)
+      and spelled_likeness(low, word) >= spelled_alike and not spelled_real(try) then
+      stats_add(spelled_pending, word, low, 1)
+      return
+    end
+  end
+  if not (w.first and w.fixed) then return end -- you backspaced part of it, then typed the rest again
+  local first = spelled_strip(w.first)
+  local a, b = spelled_chars(vim.fn.tolower(first)), spelled_chars(word)
+  local right = 0
+  while a[right + 1] ~= nil and a[right + 1] == b[right + 1] do right = right + 1 end
+  if right == 0 or right == #a or spelled_real(first) then return end
+  stats_add(spelled_pending, word, table.concat(a, '', 1, right) .. '-' .. table.concat(a, '', right + 1), 1)
+end
+
+-- Called before each key typed in insert mode. It reads the word before the cursor, so it sees what the key before did to
+-- it - added to it, backspaced into it, deleted it all - however that key did it (<BS>, <C-w>, completion ...)
+local function spelled_key(key)
+  if vim.bo.buftype ~= '' then return end
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+  local line = vim.api.nvim_get_current_line()
+  local text = line:sub(1, col):match(spelled_letters .. '*$')
+  local w = spelled_word
+  if w.row ~= row or w.col ~= col - #text then -- a new word, or the cursor moved to another one
+    w = { row = row, col = col - #text, text = text, tries = {} }
+    spelled_word = w
+  elseif text == '' and w.text ~= '' then -- deleted it all
+    table.insert(w.tries, w.first or w.text)
+    w.first, w.fixed = nil, false
+  elseif #text < #w.text and w.text:sub(1, #text) == text then -- backspaced into it
+    w.first = w.first or w.text
+  elseif text ~= w.text then -- typed more of it
+    w.fixed = w.first ~= nil
+    w.typed = true
+  end
+  w.text = text
+  if spelled_ends[key] or (key:match('^[%p%d]$') and key ~= "'") then
+    local joined = line:sub(col + 1):match('^[%a\128-\255]') -- letters right after the cursor
+    if not joined then spelled_check(w) end -- (not when splitting a word in two)
+    -- ~/.wordstats. With letters after the cursor, a space / . / <CR> still ends the word you typed (i on "world", then
+    -- "hello " -> hello world), but leaving insert mode doesn't: i on "world", then "hello" kj -> helloworld
+    local word = vim.fn.tolower(spelled_strip(text))
+    if w.typed and word ~= '' and not (joined and (key == '<Esc>' or key == '<C-C>')) then
+      words_pending[word] = (words_pending[word] or 0) + 1
+    end
+    spelled_word = {}
+  end
+end
+
+-- When keys queue up (typing fast, over ssh, Neovim busy for a moment), Neovim reads a run of letters before putting any of
+-- them in, so spelled_key would find the word before the cursor lagging behind. With an InsertCharPre autocmd it can't do
+-- that - it has to run it for each letter - so it puts each one in before reading the next key.
+vim.api.nvim_create_autocmd('InsertCharPre', {
+  callback = function() end,
+  desc = 'Put typed letters in one at a time, so ~/.spelledwrongstats sees each one land',
+})
+
+-- Neovim runs an Alt chord that isn't mapped as <Esc> then the key - which looks just like a real <Esc> with a key already
+-- waiting behind it (typing fast, Neovim busy). So map each one to that same <Esc> + key: it does what it did before, but
+-- reaches the key stats as one <M-j>, and an <Esc> is always a real <Esc>. Alt chords you've mapped are left alone, and
+-- not on the : command line, where an <Esc> from a mapping runs the command instead of cancelling it.
+local alt_names = { ['<'] = 'lt', ['|'] = 'Bar', ['\\'] = 'Bslash' }
+local alt_keys = { 'Space', 'CR', 'BS', 'Tab', 'Del', 'Left', 'Right', 'Up', 'Down', 'Home', 'End', 'PageUp', 'PageDown' }
+for c = 33, 126 do table.insert(alt_keys, alt_names[string.char(c)] or string.char(c)) end
+for _, mode in ipairs({ 'n', 'x', 'o', 'i' }) do
+  for _, k in ipairs(alt_keys) do
+    local lhs = '<M-' .. k .. '>'
+    if vim.fn.maparg(lhs, mode) == '' then
+      vim.keymap.set(mode, lhs, '<Esc>' .. (#k > 1 and '<' .. k .. '>' or k), { remap = true, desc = 'Alt chord: <Esc> then the key' })
+    end
+  end
+end
+
 vim.on_key(function(_, typed)
   if typed == '' or jumping then return end -- keys produced by mappings, or a jump's letter / label
   local key = vim.fn.keytrans(typed)
   local mode = vim.api.nvim_get_mode().mode
-  if key == '<Esc>' and vim.fn.getchar(1) ~= 0 then -- its key is already queued, so this is an Alt chord (a real <Esc> is alone)
-    stats_alt_mode = mode
-    return
-  end
-  if stats_alt_mode then
-    key, mode, stats_alt_mode = '<M-' .. (key:match('^<(.+)>$') or key) .. '>', stats_alt_mode, nil
-  end
-  -- typing, unless the key belongs to a normal mode combo (o, a pause, then n: "on") or it's kj -> <Esc> (arrives as one "kj")
+  -- typing, unless the key belongs to a normal mode combo (o, a pause, then n: "on")
   local typing = mode:match('^i') and not (stats_cmd and stats_cmd.wants)
-    and vim.fn.maparg(key, 'i'):lower() ~= '<esc>'
+  local exits = typing and vim.fn.maparg(key, 'i'):lower() == '<esc>' -- kj -> <Esc>, which arrives as one "kj"
   for _, combo in ipairs(stats_split(key, mode:match('^[vV\22]') and 'x' or 'n')) do stats_press(combo, mode) end
-  if typing then
+  if exits then
+    spelled_key('<Esc>')
+  elseif typing then
     for _, k in ipairs(stats_keys(key)) do
-      stats_add(typing_pending, 'insert', (k:gsub('<lt>', '<'):gsub(',', '<comma>')), 1)
+      local name = typing_name(k)
+      stats_add(typing_pending, 'insert', name, 1)
+      if prev_key then stats_add(prev_pending, name, prev_key, 1) end
+      prev_key = name
+      spelled_key(k)
     end
   end
 end, vim.api.nvim_create_namespace('key_stats'))
 
--- Add the new counts to the file (re-reading it first, so several Neovims don't overwrite each other)
-local function stats_write(file, sections, pending)
-  if next(pending) == nil then return end
-  local counts, section = {}, nil
-  local f = io.open(file, 'r')
-  if f then
-    for line in f:lines() do
-      local header = line:match('^## (.+)$')
-      local combo, n = line:match('^(.-),%s+(%d+)%s*$')
-      if header then
-        section = header
-      elseif section and combo and combo ~= '' then
-        stats_add(counts, section, combo, tonumber(n))
+vim.api.nvim_create_autocmd('InsertEnter', {
+  callback = function()
+    prev_key = nil
+    spelled_word = {}
+  end,
+  desc = 'Start a new run of keys for ~/.prevletterstats, and a new word for ~/.spelledwrongstats and ~/.wordstats',
+})
+
+-- A group's combos, most used first
+local function stats_sorted(combos)
+  local list = {}
+  for combo, n in pairs(combos) do table.insert(list, { combo, n }) end
+  table.sort(list, function(a, b) return a[2] > b[2] or (a[2] == b[2] and a[1] < b[1]) end)
+  return list
+end
+
+local function stats_width(counts) -- the longest combo in the file, up to 20 (so one long : command doesn't push them all out)
+  local width = 0
+  for _, combos in pairs(counts) do
+    for combo in pairs(combos) do width = math.max(width, vim.fn.strdisplaywidth(combo)) end
+  end
+  return math.min(width, 20)
+end
+
+-- "e,          204983": numbers lined up 2 spaces after the longest combo in the file (a longer one just gets the 2 spaces)
+local function stats_lines(combos, width, indent, out)
+  for _, e in ipairs(stats_sorted(combos)) do
+    table.insert(out, indent .. e[1] .. ',' .. string.rep(' ', math.max(width - vim.fn.strdisplaywidth(e[1]), 0) + 2) .. e[2])
+  end
+end
+
+-- ~/.vimstats and ~/.typingstats: "## normal" then its combos, a blank line between sections
+local function sections_read(lines, counts, fold) -- fold: change each combo, e.g. lowercase it
+  local section
+  for line in lines do
+    local header = line:match('^## (.+)$')
+    local combo, n = line:match('^(.-),%s+(%d+)%s*$')
+    if header then
+      section = header
+    elseif section and combo and combo ~= '' then
+      stats_add(counts, section, fold and fold(combo) or combo, tonumber(n))
+    end
+  end
+end
+
+local function sections_show(order) -- the sections, in the order they're listed in the file
+  return function(counts)
+    local out, width = {}, stats_width(counts)
+    for _, name in ipairs(order) do
+      if counts[name] then
+        if #out > 0 then table.insert(out, '') end
+        table.insert(out, '## ' .. name)
+        stats_lines(counts[name], width, '', out)
       end
     end
+    return out
+  end
+end
+
+-- ~/.prevletterstats: a key, then the keys typed before it indented under it, with --- between keys
+local prev_not_keys = { ['<enter-insert-mode>'] = true, ['<kj>'] = true } -- (an older version wrote these: drop them)
+local function prev_read(lines, counts)
+  local key
+  for line in lines do
+    local prev, n = line:match('^%s+(.-),%s+(%d+)%s*$')
+    if prev then
+      prev = vim.fn.tolower(prev)
+      if key and prev ~= '' and not prev_not_keys[key] and not prev_not_keys[prev] then
+        stats_add(counts, key, prev, tonumber(n))
+      end
+    elseif line ~= '---' and line ~= '' then
+      key = vim.fn.tolower(line)
+    end
+  end
+end
+
+-- a-z, then 0-9, other characters, and last the named keys (<backspace>, <space> ...)
+local function prev_rank(key)
+  return key:match('^%l$') and 1 or key:match('^%d$') and 2 or key:match('^<.+>$') and 4 or 3
+end
+
+local function prev_show(counts)
+  local keys = vim.tbl_keys(counts)
+  table.sort(keys, function(a, b)
+    local ra, rb = prev_rank(a), prev_rank(b)
+    return ra < rb or (ra == rb and a < b)
+  end)
+  local out, width = {}, stats_width(counts)
+  for i, key in ipairs(keys) do
+    if i > 1 then table.insert(out, '---') end
+    table.insert(out, key)
+    stats_lines(counts[key], width, '    ', out)
+  end
+  return out
+end
+
+-- ~/.spelledwrongstats: a word and how many times you misspelled it, then each way you misspelled it indented under it,
+-- most common first (with how many times, if it's more than once)
+local function spelled_read(lines, counts)
+  local word
+  for line in lines do
+    local how, n = line:match('^%s+%- (%S+)%s*(%d*)%s*$')
+    if how then
+      if word then stats_add(counts, word, how, tonumber(n) or 1) end
+    elseif line:match('^%S') then
+      word = line:match('^%S+')
+    end
+  end
+end
+
+local function spelled_show(counts)
+  local totals, width = {}, 0 -- (the counts line up after the longest line, up to 24)
+  for word, hows in pairs(counts) do
+    totals[word] = 0
+    width = math.max(width, vim.fn.strdisplaywidth(word))
+    for how, n in pairs(hows) do
+      totals[word] = totals[word] + n
+      width = math.max(width, vim.fn.strdisplaywidth('    - ' .. how))
+    end
+  end
+  width = math.min(width, 24)
+  local pad = function(text) return text .. string.rep(' ', math.max(width - vim.fn.strdisplaywidth(text), 0) + 2) end
+  local out = {}
+  for _, e in ipairs(stats_sorted(totals)) do
+    table.insert(out, pad(e[1]) .. e[2])
+    for _, how in ipairs(stats_sorted(counts[e[1]])) do
+      table.insert(out, how[2] > 1 and pad('    - ' .. how[1]) .. how[2] or '    - ' .. how[1])
+    end
+  end
+  return out
+end
+
+-- ~/.wordstats: a word and how many times you've typed it, most typed first, the counts lined up on the right.
+-- It holds every word you've ever typed, so it gets long - re-reading, sorting and writing 60,000 words takes ~1/4 second.
+-- So it's done in a background thread, not every 10 seconds in the middle of your typing. This is what runs there: only
+-- plain Lua (no vim.*, no upvalues), given the new counts as text ("word n" a line). It returns an error, if it failed.
+local function words_write(file, tmp, new)
+  local ok, err = pcall(function()
+    local counts = {}
+    local f = io.open(file, 'r')
+    if f then
+      for line in f:lines() do
+        local word, n = line:match('^(%S+)%s+(%d+)%s*$')
+        if word then counts[word] = (counts[word] or 0) + tonumber(n) end
+      end
+      f:close()
+    end
+    for word, n in new:gmatch('(%S+) (%d+)') do counts[word] = (counts[word] or 0) + tonumber(n) end
+    local list, width = {}, 0 -- (lined up after the longest word, up to 20)
+    for word, n in pairs(counts) do
+      local e = { word, n, #(word:gsub('[\128-\191]', '')) } -- (its width: one per letter - é is 2 bytes, the 2nd \128-\191)
+      list[#list + 1] = e
+      width = math.max(width, e[3])
+    end
+    table.sort(list, function(a, b) return a[2] > b[2] or (a[2] == b[2] and a[1] < b[1]) end)
+    width = math.min(width, 20)
+    local digits, out = list[1] and #tostring(list[1][2]) or 0, {} -- (the first count is the biggest)
+    for i, e in ipairs(list) do
+      local n = tostring(e[2])
+      out[i] = e[1] .. string.rep(' ', math.max(width - e[3], 0) + 2 + digits - #n) .. n
+    end
+    local w = assert(io.open(tmp, 'w')) -- write then rename, so the file is never half-written
+    w:write(table.concat(out, '\n') .. '\n')
+    w:close()
+    assert(os.rename(tmp, file))
+  end)
+  if not ok then return tostring(err) end
+end
+
+local words_busy = false -- a thread is writing ~/.wordstats
+local function words_save(quitting)
+  if words_busy then
+    if not quitting then return end -- (the new counts wait for the next save)
+    vim.wait(5000, function() return not words_busy end) -- (let it finish, or it would write over this)
+  end
+  local words = words_pending
+  if next(words) == nil then return end
+  words_pending = {}
+  local new = {}
+  for word, n in pairs(words) do table.insert(new, word .. ' ' .. n) end
+  local tmp = words_file .. '.tmp' .. vim.fn.getpid()
+  if quitting then return words_write(words_file, tmp, table.concat(new, '\n')) end -- (no time for a thread)
+  words_busy = true
+  vim.uv.new_work(words_write, function(err)
+    words_busy = false
+    if err then -- keep the counts for next time
+      for word, n in pairs(words) do words_pending[word] = (words_pending[word] or 0) + n end
+    end
+  end):queue(words_file, tmp, table.concat(new, '\n'))
+end
+
+-- Add the new counts to the file (re-reading it first, so several Neovims don't overwrite each other)
+local function stats_write(file, pending, read, show)
+  if next(pending) == nil then return end
+  local counts = {}
+  local f = io.open(file, 'r')
+  if f then
+    read(f:lines(), counts)
     f:close()
   end
   for name, combos in pairs(pending) do
     for combo, n in pairs(combos) do stats_add(counts, name, combo, n) end
     pending[name] = nil
   end
-
-  local width = 0
-  for _, combos in pairs(counts) do
-    for combo in pairs(combos) do width = math.max(width, vim.fn.strdisplaywidth(combo)) end
-  end
-  local out = {}
-  for _, name in ipairs(sections) do
-    if counts[name] then
-      local list = {}
-      for combo, n in pairs(counts[name]) do table.insert(list, { combo, n }) end
-      table.sort(list, function(a, b) return a[2] > b[2] or (a[2] == b[2] and a[1] < b[1]) end)
-      if #out > 0 then table.insert(out, '') end
-      table.insert(out, '## ' .. name)
-      for _, e in ipairs(list) do -- "e,          204983": numbers lined up 2 spaces after the longest combo
-        table.insert(out, e[1] .. ',' .. string.rep(' ', width - vim.fn.strdisplaywidth(e[1]) + 2) .. e[2])
-      end
-    end
-  end
   local tmp = file .. '.tmp' .. vim.fn.getpid() -- write then rename, so the file is never half-written
   local w = io.open(tmp, 'w')
   if not w then return end
-  w:write(table.concat(out, '\n') .. '\n')
+  w:write(table.concat(show(counts), '\n') .. '\n')
   w:close()
   os.rename(tmp, file)
 end
 
-local function stats_save()
-  stats_write(stats_file, stats_sections, stats_pending)
-  stats_write(typing_file, typing_sections, typing_pending)
+local function stats_save(quitting)
+  stats_write(stats_file, stats_pending, sections_read, sections_show(stats_sections))
+  stats_write(typing_file, typing_pending, function(lines, counts) sections_read(lines, counts, vim.fn.tolower) end,
+    sections_show(typing_sections))
+  stats_write(prev_file, prev_pending, prev_read, prev_show)
+  stats_write(spelled_file, spelled_pending, spelled_read, spelled_show)
+  words_save(quitting)
 end
 
 local stats_timer = vim.uv.new_timer()
 stats_timer:start(10000, 10000, vim.schedule_wrap(stats_save))
 vim.api.nvim_create_autocmd('VimLeavePre', {
-  callback = function() stats_commit(); stats_save() end,
-  desc = 'Save key stats to ~/.vimstats and ~/typingstats',
+  callback = function() stats_commit(); stats_save(true) end,
+  desc = 'Save key stats to ~/.vimstats, ~/.typingstats, ~/.prevletterstats, ~/.spelledwrongstats and ~/.wordstats',
 })
