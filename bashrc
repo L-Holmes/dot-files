@@ -278,9 +278,28 @@ makesilent () {
 
 # ============================================
 
+# prints the next free recording number in the current folder: highest + 1
+#   ==> e.g. 1.wav and 8.wav exist -> 9
+#   (raw_8.wav counts too, so a raw take is never overwritten)
+_next_wav_number() {
+    local file num max=0
+    for file in *.wav; do
+        if [[ $file =~ ^(raw_)?([0-9]+)\.wav$ ]]; then
+            num=$((10#${BASH_REMATCH[2]}))   # 10# so that "08" isn't read as octal
+            (( num > max )) && max=$num
+        fi
+    done
+    echo $((max + 1))
+}
+
+# record a voiceover. Never overwrites an existing file.
+#   ==> e.g. record         -> 1.wav, then 2.wav, then 3.wav ...
+#   ==> e.g. record intro   -> intro.wav (or the next number, if intro.wav is taken)
 record() {
-    # Exit cleanly if a command fails or an unset variable is used inside this function
-    local EPISODE="${1:-episode}"
+    local EPISODE="$1"
+    if [ -z "$EPISODE" ] || [ -e "${EPISODE}.wav" ] || [ -e "raw_${EPISODE}.wav" ]; then
+        EPISODE=$(_next_wav_number)
+    fi
     local RAW_FILE="raw_${EPISODE}.wav"
     local OUTPUT="${EPISODE}.wav"
 
@@ -295,6 +314,7 @@ record() {
     echo "---------------------------------------------------------------"
     echo "🔍 PRE-FLIGHT CHECK"
     echo "🎙️  Current Input:  $DEVICE_NAME"
+    echo "💾 Will save to:   $OUTPUT"
     echo "---------------------------------------------------------------"
     echo "👉 Press [ENTER] to start recording, or [Ctrl+C] to abort."
     read -r
@@ -303,19 +323,27 @@ record() {
     echo "🎙 Recording → $RAW_FILE"
     echo "🔴 Recording is LIVE 🔴"
     echo "Press 'q' to stop"
-    ffmpeg -y -f pulse -i default -ac 1 -ar 48000 "$RAW_FILE"
+    ffmpeg -n -f pulse -i default -ac 1 -ar 48000 "$RAW_FILE"
     echo "==================================="
     echo "Recording Done."
 
     # ── PROCESS (TONE + CONTROL) ────────────────────────────────────────
     echo "🎛 Processing..."
-    ffmpeg -y -i "$RAW_FILE" -af "highpass=f=70,agate=threshold=-42dB:ratio=2:attack=10:release=200,equalizer=f=120:width_type=h:width=100:g=4,equalizer=f=3000:width_type=h:width=2000:g=2,acompressor=threshold=-20dB:ratio=2.5:attack=15:release=200,alimiter=limit=0.84,loudnorm=I=-19:TP=-1.5:LRA=11" "$OUTPUT"
+    ffmpeg -n -i "$RAW_FILE" -af "highpass=f=70,agate=threshold=-42dB:ratio=2:attack=10:release=200,equalizer=f=120:width_type=h:width=100:g=4,equalizer=f=3000:width_type=h:width=2000:g=2,acompressor=threshold=-20dB:ratio=2.5:attack=15:release=200,alimiter=limit=0.84,loudnorm=I=-19:TP=-1.5:LRA=11" "$OUTPUT"
 
     echo "---------------------------------------------------------------"
     echo "✅ DONE"
     echo "🎧 Final: $OUTPUT"
     echo "🗂 Raw:   $RAW_FILE"
     echo "▶ Preview: aplay $OUTPUT"
+}
+
+# ============================================
+
+# cut the long silences out of an audio file
+#   ==> e.g. cutdown input.wav output.wav
+cutdown() {
+    uv run --script "$HOME/.local/bin/cut_down_audio.py" "$@"
 }
 
 # ============================================
